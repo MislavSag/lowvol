@@ -4,10 +4,10 @@ library(finfeatures)
 
 # paths
 if (interactive()) {
-  PATH_PRICES     = file.path("D:/strategies/exuber/daily/prices")
-  PATH_PREDICTORS = file.path("D:/strategies/exuber/predictors_daily")
+  PATH_PRICES     = file.path("D:/strategies/lowvol/prices")
+  PATH_PREDICTORS = file.path("D:/strategies/lowvol/predictors_daily")
 } else {
-  PATH_PRICES = file.path("daily", "prices")
+  PATH_PRICES = file.path("prices")
   PATH_PREDICTORS = file.path("predictors_daily")
 }
 
@@ -29,22 +29,20 @@ symbol_i = symbols[i]
 
 # Import Ohlcv data
 ohlcv = fread(file.path(PATH_PRICES, paste0(symbol_i, ".csv")))
-# if (attr(ohlcv$date, "tzone") == "UTC") {
-#   attr(ohlcv$date, "tzone") <- "America/New_York"
-# }
-# tail(ohlcv, 15)
-ohlcv[symbol == "a"]
 head(ohlcv, 20)
 ohlcv = Ohlcv$new(ohlcv[, .(symbol, date, open, high, low, close, volume)],
                   date_col = "date")
 
 # Exuber
-exuber_init = RollingExuber$new(
-  windows = c(100, 400, 800, 1000),
+fracdiff_init = RollingFracdiff$new(
+  windows = c(252),
   workers = 1L,
   at = 1:nrow(ohlcv$X),
   lag = 0L,
-  exuber_lag = c(0L, 1L)
+  nar = c(1),
+  nma = c(1)
 )
-exuber = exuber_init$get_rolling_features(ohlcv, log_prices = TRUE)
-fwrite(exuber, file.path(PATH_PREDICTORS, paste0(symbol_i, ".csv")))
+fracdiff_p = fracdiff_init$get_rolling_features(ohlcv, log_prices = TRUE)
+fwrite(fracdiff_p, file.path(PATH_PREDICTORS, paste0(symbol_i, ".csv")))
+
+# Delete prices folder to free space

@@ -54,5 +54,3 @@ writeLines(cont, "padobran_predictors.sh")
 # Add to padobran
 # scp -r /home/sn/data/strategies/pead/prices padobran:/home/jmaric/peadml/prices
 
-# Delete prices folder to free space
-
