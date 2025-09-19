@@ -1,0 +1,22 @@
+Bootstrap: docker
+From: r-base:4.5.0
+
+%post
+
+  # apt
+  apt-get update
+  apt-get install -y libssl-dev libxml2-dev libcurl4-openssl-dev
+
+  # Fundamental packages
+  R --slave -e 'install.packages("data.table")'
+  R --slave -e 'install.packages("R6")'
+  R --slave -e 'install.packages("bit64")'
+  R --slave -e 'install.packages("remotes")'
+  R --slave -e 'remotes::install_github("MislavSag/finfeatures")'
+  R --slave -e 'install.packages("exuber")'
+  R --slave -e 'install.packages("fracdiff")'
+  R --slave -e 'install.packages("lubridate")'
+
+%runscript
+  # Script to run when the container is executed; passes commands to Rscript
+  Rscript $@
