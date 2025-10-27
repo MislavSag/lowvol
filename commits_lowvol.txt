@@ -1,0 +1,870 @@
+0441b6b85311468286b8c868f61322b5234a9047 MislavSag Mon Sep 22 12:17:56 2025 +0200 lowbeta low vol
+diff --git a/lowbeta_lowvol.R b/lowbeta_lowvol.R
+new file mode 100644
+index 0000000..9fce38d
+--- /dev/null
++++ b/lowbeta_lowvol.R
+@@ -0,0 +1,309 @@
++library(fastverse)
++library(finutils)
++library(fracdiff)
++library(roll)
++library(ggplot2)
++library(PerformanceAnalytics)
++library(AzureStor)
++library(qlcal)
++library(RollingWindow)
++library(ggplot2)
++
++# Setup
++setCalendar("UnitedStates/NYSE")
++
++# Prices data
++prices = qc_daily_parquet(
++  file_path = "F:/lean/data/all_stocks_daily",
++  etfs = FALSE,
++  etf_cons = c("F:/lean/data/equity/usa/universes/etf/iwm",
++               "F:/lean/data/equity/usa/universes/etf/spy"),
++  min_obs = 252,
++  duplicates = "fast",
++  add_dv_rank = FALSE,
++  add_day_of_month = FALSE,
++  market_symbol = "spy",
++  profiles_fmp = TRUE,
++  fmp_api_key = Sys.getenv("FMP-SNP")
++)
++prices[, month := data.table::yearmon(date)]
++
++# Remove ETFS
++nrow(prices[isEtf == TRUE | isFund == TRUE]) / nrow(prices)
++prices = prices[isEtf == FALSE & isFund == FALSE]
++
++# Calculate rolling beta
++setorder(prices, symbol, date)
++prices[, beta_roll_year     := RollingWindow::RollingBeta(spy_returns, returns, window = 252), by = symbol]
++prices[, beta_roll_halfyear := RollingWindow::RollingBeta(spy_returns, returns, window = 125), by = symbol]
++prices[, beta_roll_month    := RollingWindow::RollingBeta(spy_returns, returns, window = 22), by = symbol]
++weights_ = rep(1 / 3, 3)
++prices[, beta_average_year :=
++         beta_roll_year * weights_[3] +
++         beta_roll_halfyear * weights_[2] +
++         beta_roll_month * weights_[1]
++]
++
++# Get residual returns
++prices[, resid := returns - beta_average_year * spy_returns]
++
++# Rolling sd
++setorder(prices, symbol, date)
++prices[, sd_roll_year := roll::roll_sd(returns, width = 252), by = symbol]
++prices[, sd_roll_halfyear := roll::roll_sd(returns, width = 125), by = symbol]
++prices[, sd_roll_month := roll::roll_sd(returns, width = 22), by = symbol]
++weights_ = c(252, 150, 22) / sum(c(252, 150, 22))
++prices[, sd_average_year :=
++         sd_roll_year * weights_[3] +
++         sd_roll_halfyear * weights_[2] +
++         sd_roll_month * weights_[1]
++]
++
++# Rolling idiosyncratic
++setorder(prices, symbol, date)
++prices[, sd_roll_year_idio := roll::roll_sd(resid, width = 252), by = symbol]
++prices[, sd_roll_halfyear_idio := roll::roll_sd(resid, width = 125), by = symbol]
++prices[, sd_roll_month_idio := roll::roll_sd(resid, width = 22), by = symbol]
++weights_ = c(252, 150, 22) / sum(c(252, 150, 22))
++prices[, sd_average_year_idio :=
++         sd_roll_year_idio * weights_[3] +
++         sd_roll_halfyear_idio * weights_[2] +
++         sd_roll_month_idio * weights_[1]
++]
++
++# Tail risk
++prices[, resid_neg := fifelse(resid < 0, resid, 0)]
++prices[, sd_roll_year_neg := roll_sd(resid_neg, width = 252), by = symbol]
++prices[, sd_roll_halfyear_neg := roll_sd(resid_neg, width = 125), by = symbol]
++prices[, sd_roll_month_neg := roll_sd(resid_neg, width = 22), by = symbol]
++weights_ = c(252, 125, 22) / sum(c(252, 125, 22))
++prices[, sd_average_year_neg :=
++         sd_roll_year_neg * weights_[3] +
++         sd_roll_halfyear_neg * weights_[2] +
++         sd_roll_month_neg * weights_[1]
++]
++
++# Lottery (MAX): max 1d return over last 21d
++prices[, max21 := roll::roll_max(returns, 21), by = symbol]
++
++# Momentum
++setorder(prices, symbol, date)
++months_size = 2:12
++mom_vars = paste0("momentum_", months_size)
++f_ = function(x, n) {
++  shift(x, 21) / shift(x, n * 21) - 1
++}
++prices[, (mom_vars) := lapply(months_size, function(x) f_(close, x)), by = symbol]
++weights_ = c(12:2) / sum(12:2)
++prices[, momentum_average_year :=
++         momentum_2 * weights_[1] +
++         momentum_3 * weights_[2] +
++         momentum_4 * weights_[3] +
++         momentum_5 * weights_[4] +
++         momentum_6 * weights_[5] +
++         momentum_7 * weights_[6] +
++         momentum_8 * weights_[7] +
++         momentum_9 * weights_[8] +
++         momentum_10 * weights_[9] +
++         momentum_11 * weights_[10] +
++         momentum_12 * weights_[11]
++]
++prices[, mom := momentum_average_year / sd_average_year]
++
++# Basic cleaning
++dt = prices[, .(symbol, date, open, close, close_raw, volume, returns, spy,
++                iwm, month, sd_average_year, beta_average_year,
++                sd_average_year_idio, sd_average_year_neg, max21, mom)]
++dt = na.omit(dt,
++             cols = c("sd_average_year", "beta_average_year",
++                      "sd_average_year_idio", "sd_average_year_neg", "mom"))
++
++# ADV20 in USD
++dt[, dollar_vol := close_raw * volume]
++dt[, adv20 := frollmean(dollar_vol, 22), by = symbol]
++
++# Coarse universe filtering
++# 1) etf
++dt = prices[spy == 1]
++# 1) dv
++dt = dt[close_raw > 2 & adv20 > 1e7]
++
++# Cap very big or very low values
++nrow(dt[beta_average_year > 4]) / nrow(dt) * 100
++nrow(dt[beta_average_year < -4]) / nrow(dt) * 100
++dt = dt[beta_average_year %between% c(-4, 4)]
++dt[, median(sd_average_year)]
++nrow(dt[sd_average_year > 4]) / nrow(dt) * 100
++nrow(dt[sd_average_year < 0.0005]) / nrow(dt) * 100
++dt = dt[sd_average_year %between% c(0.005, 4)]
++dt[, median(sd_average_year_idio)]
++nrow(dt[sd_average_year_idio > 4]) / nrow(dt) * 100
++nrow(dt[sd_average_year_idio < 0.0005]) / nrow(dt) * 100
++dt = dt[sd_average_year_idio %between% c(0.005, 4)]
++
++# Descriptive
++summary(dt[, sd_average_year])
++summary(dt[, beta_average_year])
++dt[, cor(sd_average_year, beta_average_year)]
++dt[, .N, by = date]
++
++# Beta and vol ranks
++dt[, beta_rank := ((frank(beta_average_year, ties.method = "min") - 1) / (.N - 1)) * 100,  by = date]
++dt[, sd_rank := ((frank(sd_average_year, ties.method = "min") - 1) / (.N - 1)) * 100,  by = date]
++dt[, sd_rank_idio := ((frank(sd_average_year_idio, ties.method = "min") - 1) / (.N - 1)) * 100,  by = date]
++dt[, sd_rank_neg := ((frank(sd_average_year_neg, ties.method = "min") - 1) / (.N - 1)) * 100,  by = date]
++dt[, max21_rank  := ((frank(max21, ties.method = "min") - 1) / (.N - 1)) * 100,  by = date]
++dt[, mom_rank    := ((frank(mom, ties.method = "min") - 1) / (.N - 1)) * 100,  by = date]
++dt[, rank := beta_rank + sd_rank]
++dt[, rank_idio := beta_rank + sd_rank_idio]
++dt[, rank_neg := beta_rank + sd_rank_neg]
++dt[, rank_bundle := beta_rank + sd_rank_idio + max21_rank]
++dt[, rank_bundle_2 := beta_rank + sd_rank_idio + (1-mom_rank)]
++dt[, rank_bundle_3 := ((beta_rank + sd_rank_idio) / 2) + (1-mom_rank)]
++
++# Target variable
++setorder(dt, symbol, date)
++dt[, target := shift(returns, 1, type = "lead"), by = symbol]
++dt = na.omit(dt, cols = "target")
++
++# Returns over bins
++plot_ret_over_rank = function(r) {
++  dt[, .(ret = mean(target, na.rm = TRUE)), .(bin = dplyr::ntile(x, 20)), env = list(x = r)] |>
++    _[order(ret)] |>
++    ggplot(aes(bin, ret)) +
++    geom_bar(stat = "identity")
++}
++plot_ret_over_rank("rank")
++plot_ret_over_rank("rank_idio")
++plot_ret_over_rank("rank_neg")
++plot_ret_over_rank("rank_bundle")
++plot_ret_over_rank("rank_bundle_2")
++plot_ret_over_rank("rank_bundle_3")
++
++plot_monthly_bin_retutrns = function(r) {
++  dt[, .(
++    open = data.table::first(open),
++    close = data.table::last(close),
++    x = data.table::last(x)
++  ), by = .(symbol, month), env = list(x = r)] |>
++    _[, target := close / open - 1] |>
++    _[, target := shift(target, 1, type = "lead")] |>
++    _[, .(ret = mean(target, na.rm = TRUE)), .(bin = dplyr::ntile(x, 20)), env = list(x = r)] |>
++    _[order(ret)] |>
++    ggplot(aes(bin, ret)) +
++    geom_bar(stat = "identity")
++}
++plot_monthly_bin_retutrns("rank")
++plot_monthly_bin_retutrns("rank_idio")
++plot_monthly_bin_retutrns("rank_neg")
++plot_monthly_bin_retutrns("rank_bundle")
++plot_monthly_bin_retutrns("rank_bundle_2")
++plot_monthly_bin_retutrns("rank_bundle_3")
++
++# dt[, .(
++#   open = data.table::first(open),
++#   close = data.table::last(close),
++#   rank = data.table::last(rank)
++# ), by = .(symbol, month)] |>
++#   _[, target := close / open - 1] |>
++#   _[, target := shift(target, 1, type = "lead")] |>
++#   _[, bin := dplyr::ntile(rank, 10)] |>
++#   ggplot(aes(bin, target)) +
++#   ggbeeswarm::geom_quasirandom(
++#     alpha = 0.8, size = 2,
++#     aes(fill = bin)
++#   )
++
++# Daily rebalancing
++setorder(dt, date, rank)
++# Long only
++back = dt[, head(.SD, 30), by = date]
++back[, weight := 1/length(target), by = date]
++back = back[, .(ret = sum(target * weight, na.rm = TRUE)), by = date]
++setorder(back, date)
++back = as.xts.data.table(back)
++charts.PerformanceSummary(back)
++SharpeRatio.annualized(back)
++SharpeRatio.annualized(back["2019/"])
++charts.PerformanceSummary(back["2019/"])
++# Short
++back = dt[rank < 150][, tail(.SD, 10), by = date]
++back[, weight := 1/length(target), by = date]
++back = back[, .(ret = sum(target * weight, na.rm = TRUE)), by = date]
++setorder(back, date)
++back = as.xts.data.table(back)
++back = back[back < 1]
++charts.PerformanceSummary(back)
++SharpeRatio.annualized(back)
++
++# Montlhy backtest function
++backtestm = function(r, n = 50, sign = 1) {
++  back = dt[, .(
++    open = data.table::first(open),
++    close = data.table::last(close),
++    x = data.table::last(x)
++  ), by = .(symbol, month), env = list(x = r)]
++  # plot(back[, .N, by = month][, N])
++  back[, target := close / open - 1]
++  back[, target := shift(target, 1, type = "lead")]
++  setorderv(back, c("month", r))
++  if (sign == 1) {
++    back = back[, head(.SD, n), by = month]
++  } else {
++    back = back[, tail(.SD, n), by = month]
++  }
++  back[, weight := 1/length(target), by = month]
++  back = back[, .(ret = sum(target * weight * sign, na.rm = TRUE)), by = month]
++  back = as.xts.data.table(back[, .(zoo::as.Date.yearmon(month), ret)])
++  return(back)
++}
++
++# Monthly rebalancing backteests for variaous ranks
++finutils::portfolio_stats(backtestm("rank"), scale = 12)
++charts.PerformanceSummary(backtestm("rank"))
++finutils::portfolio_stats(backtestm("rank_idio"), scale = 12)
++charts.PerformanceSummary(backtestm("rank_idio"))
++finutils::portfolio_stats(backtestm("rank_neg"), scale = 12)
++charts.PerformanceSummary(backtestm("rank_neg"))
++finutils::portfolio_stats(backtestm("rank_bundle"), scale = 12)
++charts.PerformanceSummary(backtestm("rank_bundle"))
++finutils::portfolio_stats(backtestm("rank_bundle_2"), scale = 12)
++charts.PerformanceSummary(backtestm("rank_bundle_2"))
++finutils::portfolio_stats(backtestm("rank_bundle_3"), scale = 12)
++charts.PerformanceSummary(backtestm("rank_bundle_3"))
++
++# Shorts
++finutils::portfolio_stats(backtestm("rank", sign = -1), scale = 12)
++charts.PerformanceSummary(backtestm("rank", sign = -1))
++finutils::portfolio_stats(backtestm("rank_idio", sign = -1), scale = 12)
++charts.PerformanceSummary(backtestm("rank_idio", sign = -1))
++finutils::portfolio_stats(backtestm("rank_neg", sign = -1), scale = 12)
++charts.PerformanceSummary(backtestm("rank_neg", sign = -1))
++finutils::portfolio_stats(backtestm("rank_bundle", sign = -1), scale = 12)
++charts.PerformanceSummary(backtestm("rank_bundle", sign = -1))
++finutils::portfolio_stats(backtestm("rank_bundle_2", sign = -1), scale = 12)
++charts.PerformanceSummary(backtestm("rank_bundle_2", sign = -1))
++finutils::portfolio_stats(backtestm("rank_bundle_3", sign = -1), scale = 12)
++charts.PerformanceSummary(backtestm("rank_bundle_3", sign = -1))
++
++# Long Short
++back = dt[, .(
++  open = data.table::first(open),
++  close = data.table::last(close),
++  rank = data.table::last(rank)
++), by = .(symbol, month)]
++back[, target := close / open - 1]
++back[, target := shift(target, 1, type = "lead")]
++setorder(back, month, rank)
++back_short = back[, tail(.SD, 30), by = month]
++back_short = back_short[, weight := -1 / length(target) * 0.5, by = month]
++back_long  = back[, head(.SD, 30), by = month]
++back_long  = back_long[, weight := 1 / length(target), by = month]
++back = rbind(back_short, back_long)
++back = back[, .(ret = sum(target * weight, na.rm = TRUE)), by = month]
++back = as.xts.data.table(back[, .(zoo::as.Date.yearmon(month), ret)])
++charts.PerformanceSummary(back)
++SharpeRatio.annualized(back)
++# SharpeRatio.annualized(back["2019/"])
++# charts.PerformanceSummary(back["2019/"])
++
+diff --git a/padobran_to_local.R b/padobran_to_local.R
+deleted file mode 100644
+index 34c2b70..0000000
+--- a/padobran_to_local.R
++++ /dev/null
+@@ -1,94 +0,0 @@
+-library(data.table)
+-library(lubridate)
+-
+-
+-# SETUP -------------------------------------------------------------------
+-# Globals
+-if (interactive()) {
+-  PATH = "D:/strategies/exuber"
+-}
+-
+-# Create indicators directory if it doesn't exist
+-if (interactive()) {
+-  if (!dir.exists(file.path(PATH, "indicators"))) {
+-    dir.create(file.path(PATH, "indicators"))
+-  }
+-}
+-
+-
+-# DATA --------------------------------------------------------------------
+-# Check columns
+-# colnames(fread(list.files(file.path(PATH, "predictors"), full.names = TRUE)[1]))
+-
+-# Current column
+-# if (interactive()) {
+-#   i = 1L
+-# } else {
+-#   i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+-# }
+-# i = i + 2L
+-# cols = c(1, 2, i)
+-
+-# Get files
+-if (interactive()) {
+-  files = list.files(file.path(PATH, "predictors"), full.names = TRUE)
+-} else {
+-  files = list.files("predictors", full.names = TRUE)
+-}
+-
+-# Import predictors in chunks Predictors
+-system.time({
+-  dt = lapply(files, fread) # , select = cols
+-})
+-format(object.size(dt), units = "auto")
+-dt = rbindlist(dt, fill= TRUE)
+-dt[, date := with_tz(date, tzone = "America/New_York")]
+-setorder(dt, symbol, date)
+-
+-# Median aggreagation
+-radf_vars = colnames(dt)[grepl("exuber", colnames(dt))]
+-indicators_median = dt[, lapply(.SD, median, na.rm = TRUE), by = c('date'), .SDcols = radf_vars]
+-setnames(indicators_median, radf_vars, paste0("median_", radf_vars))
+-
+-# Standard deviation aggregation
+-indicators_sd = dt[, lapply(.SD, sd, na.rm = TRUE), by = c('date'), .SDcols = radf_vars]
+-setnames(indicators_sd, radf_vars, paste0("sd_", radf_vars))
+-
+-# Mean aggregation
+-indicators_mean = dt[, lapply(.SD, mean, na.rm = TRUE), by = c('date'), .SDcols = radf_vars]
+-setnames(indicators_mean, radf_vars, paste0("mean_", radf_vars))
+-
+-# Sum aggreagation
+-indicators_sum = dt[, lapply(.SD, sum, na.rm = TRUE), by = c('date'), .SDcols = radf_vars]
+-setnames(indicators_sum, radf_vars, paste0("sum_", radf_vars))
+-
+-# Expected Shartfall
+-indicators_es = dt[, lapply(.SD, function(x) {
+-  if (length(x) < 2) return(NA_real_)
+-  PerformanceAnalytics::ES(diff(x), p = 0.05, method = "modified")
+-}), by = date, .SDcols = radf_vars]
+-
+-# Merge indicators
+-indicators = Reduce(
+-  function(x, y)
+-    merge(
+-      x,
+-      y,
+-      by = "date",
+-      all.x = TRUE,
+-      all.y = TRUE
+-    ),
+-  list(
+-    indicators_sd,
+-    indicators_median,
+-    indicators_sum,
+-    indicators_mean
+-  )
+-)
+-setorder(indicators, date)
+-
+-# Remove missing values
+-indicators = na.omit(indicators)
+-
+-# Save indicators
+-fwrite(indicators, "indicators.csv")
+diff --git a/strategy_fracdiff.R b/strategy_fracdiff.R
+new file mode 100644
+index 0000000..bb50467
+--- /dev/null
++++ b/strategy_fracdiff.R
+@@ -0,0 +1,56 @@
++library(data.table)
++library(lubridate)
++
++# Globals
++if (interactive()) {
++  PATH = "D:/strategies/lowvol"
++}
++
++# Create indicators directory if it doesn't exist
++if (interactive()) {
++  if (!dir.exists(file.path(PATH, "indicators"))) {
++    dir.create(file.path(PATH, "indicators"))
++  }
++}
++
++# Import data and select columns we need
++files = list.files(file.path(PATH, "predictors_daily"), full.names = TRUE)
++files = files[1:5]
++
++dtd = lapply(files, fread)
++
++# Import predictors in chunks Predictors
++cols = c("symbol", "date", colnames(fread(files[1]))[grepl("^d_f", colnames(fread(files[1])))])
++dtd = lapply(files, fread, select = cols)
++dtd = rbindlist(dtd, fill= TRUE)
++setorder(dtd, symbol, date)
++keep = dtd[, vapply(.SD, function(x) (sum(is.na(x)) / length(x)) < 0.5, logical(1L))]
++keep = names(keep[keep == TRUE])
++dtd = dtd[, ..keep]
++
++# Descriptive
++dtd[, hist(d_fdGPH_0_5_252_log)]
++dtd[, hist(d_fdGPH_0_9_252_log)]
++
++#
++
++
++
++library(fracdiff)
++
++
++ts.test <- fracdiff.sim( 5000, ar = .2, ma = -.4, d = .3)
++fd. <- fracdiff( ts.test$series,
++                 nar = length(ts.test$ar), nma = length(ts.test$ma))
++fd.
++## Confidence intervals
++confint(fd.)
++
++## with iteration output
++fd2 <- fracdiff(ts.test$series, nar = 1, nma = 1, trace = 1)
++all.equal(fd., fd2)
++
++head(diffseries(ts.test$series, 0.3))
++head(fd.$fitted)
++head(fd.$residuals)
++fd.$
+
+66bf4ade7b6bcfe72edd589ff709756c7417f014 MislavSag Fri Sep 19 13:29:26 2025 +0200 init
+diff --git a/image.def b/image.def
+new file mode 100644
+index 0000000..8c60bb3
+--- /dev/null
++++ b/image.def
+@@ -0,0 +1,22 @@
++Bootstrap: docker
++From: r-base:4.5.0
++
++%post
++
++  # apt
++  apt-get update
++  apt-get install -y libssl-dev libxml2-dev libcurl4-openssl-dev
++
++  # Fundamental packages
++  R --slave -e 'install.packages("data.table")'
++  R --slave -e 'install.packages("R6")'
++  R --slave -e 'install.packages("bit64")'
++  R --slave -e 'install.packages("remotes")'
++  R --slave -e 'remotes::install_github("MislavSag/finfeatures")'
++  R --slave -e 'install.packages("exuber")'
++  R --slave -e 'install.packages("fracdiff")'
++  R --slave -e 'install.packages("lubridate")'
++
++%runscript
++  # Script to run when the container is executed; passes commands to Rscript
++  Rscript $@
+diff --git a/image.sh b/image.sh
+new file mode 100644
+index 0000000..dcd2d1e
+--- /dev/null
++++ b/image.sh
+@@ -0,0 +1,3 @@
++#!/bin/bash
++
++apptainer build image.sif image.def
+
+818a227a0a2f86cda59e19e2391514b276735056 MislavSag Fri Sep 19 13:25:58 2025 +0200 init
+diff --git a/padobran_predictors.R b/padobran_predictors.R
+index 34eef70..68d3f43 100644
+--- a/padobran_predictors.R
++++ b/padobran_predictors.R
+@@ -4,10 +4,10 @@ library(finfeatures)
+ 
+ # paths
+ if (interactive()) {
+-  PATH_PRICES     = file.path("D:/strategies/exuber/daily/prices")
+-  PATH_PREDICTORS = file.path("D:/strategies/exuber/predictors_daily")
++  PATH_PRICES     = file.path("D:/strategies/lowvol/prices")
++  PATH_PREDICTORS = file.path("D:/strategies/lowvol/predictors_daily")
+ } else {
+-  PATH_PRICES = file.path("daily", "prices")
++  PATH_PRICES = file.path("prices")
+   PATH_PREDICTORS = file.path("predictors_daily")
+ }
+ 
+@@ -29,22 +29,20 @@ symbol_i = symbols[i]
+ 
+ # Import Ohlcv data
+ ohlcv = fread(file.path(PATH_PRICES, paste0(symbol_i, ".csv")))
+-# if (attr(ohlcv$date, "tzone") == "UTC") {
+-#   attr(ohlcv$date, "tzone") <- "America/New_York"
+-# }
+-# tail(ohlcv, 15)
+-ohlcv[symbol == "a"]
+ head(ohlcv, 20)
+ ohlcv = Ohlcv$new(ohlcv[, .(symbol, date, open, high, low, close, volume)],
+                   date_col = "date")
+ 
+ # Exuber
+-exuber_init = RollingExuber$new(
+-  windows = c(100, 400, 800, 1000),
++fracdiff_init = RollingFracdiff$new(
++  windows = c(252),
+   workers = 1L,
+   at = 1:nrow(ohlcv$X),
+   lag = 0L,
+-  exuber_lag = c(0L, 1L)
++  nar = c(1),
++  nma = c(1)
+ )
+-exuber = exuber_init$get_rolling_features(ohlcv, log_prices = TRUE)
+-fwrite(exuber, file.path(PATH_PREDICTORS, paste0(symbol_i, ".csv")))
++fracdiff_p = fracdiff_init$get_rolling_features(ohlcv, log_prices = TRUE)
++fwrite(fracdiff_p, file.path(PATH_PREDICTORS, paste0(symbol_i, ".csv")))
++
++# Delete prices folder to free space
+diff --git a/prepare_data_padobran.R b/prepare_data_padobran.R
+index ddc9aee..c6fdc94 100644
+--- a/prepare_data_padobran.R
++++ b/prepare_data_padobran.R
+@@ -54,5 +54,3 @@ writeLines(cont, "padobran_predictors.sh")
+ # Add to padobran
+ # scp -r /home/sn/data/strategies/pead/prices padobran:/home/jmaric/peadml/prices
+ 
+-# Delete prices folder to free space
+-
+
+030e786226699c26eb884a4fa5c63822227339a9 MislavSag Fri Sep 19 13:15:17 2025 +0200 init
+diff --git a/.gitignore b/.gitignore
+index 5b6a065..221b531 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,3 +2,4 @@
+ .Rhistory
+ .RData
+ .Ruserdata
++.Renviron
+
+c99385fef93d5584cc7fd109baca6159c10fe111 MislavSag Fri Sep 19 13:14:15 2025 +0200 init
+diff --git a/.Renviron b/.Renviron
+new file mode 100644
+index 0000000..958a1a4
+--- /dev/null
++++ b/.Renviron
+@@ -0,0 +1,3 @@
++APIKEY=6c390b6279b8a67cc7f63cbecbd69430
++ENDPOINT=https://snpmarketdata.blob.core.windows.net
++KEY=0M4WRlV0/1b6b3ZpFKJvevg4xbC/gaNBcdtVZW+zOZcRi0ZLfOm1v/j2FZ4v+o8lycJLu1wVE6HT+ASt0DdAPQ==
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..5b6a065
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,4 @@
++.Rproj.user
++.Rhistory
++.RData
++.Ruserdata
+diff --git a/lowvol.Rproj b/lowvol.Rproj
+new file mode 100644
+index 0000000..e83436a
+--- /dev/null
++++ b/lowvol.Rproj
+@@ -0,0 +1,16 @@
++Version: 1.0
++
++RestoreWorkspace: Default
++SaveWorkspace: Default
++AlwaysSaveHistory: Default
++
++EnableCodeIndexing: Yes
++UseSpacesForTab: Yes
++NumSpacesForTab: 2
++Encoding: UTF-8
++
++RnwWeave: Sweave
++LaTeX: pdfLaTeX
++
++AutoAppendNewline: Yes
++StripTrailingWhitespace: Yes
+diff --git a/padobran_predictors.R b/padobran_predictors.R
+new file mode 100644
+index 0000000..34eef70
+--- /dev/null
++++ b/padobran_predictors.R
+@@ -0,0 +1,50 @@
++library(data.table)
++library(finfeatures)
++
++
++# paths
++if (interactive()) {
++  PATH_PRICES     = file.path("D:/strategies/exuber/daily/prices")
++  PATH_PREDICTORS = file.path("D:/strategies/exuber/predictors_daily")
++} else {
++  PATH_PRICES = file.path("daily", "prices")
++  PATH_PREDICTORS = file.path("predictors_daily")
++}
++
++# Create directory if it doesnt exists
++if (!dir.exists(PATH_PREDICTORS)) {
++  dir.create(PATH_PREDICTORS)
++}
++
++# Get index
++if (interactive()) {
++  i = 1L
++} else {
++  i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
++}
++
++# Get symbol
++symbols = gsub("\\.csv", "", list.files(PATH_PRICES))
++symbol_i = symbols[i]
++
++# Import Ohlcv data
++ohlcv = fread(file.path(PATH_PRICES, paste0(symbol_i, ".csv")))
++# if (attr(ohlcv$date, "tzone") == "UTC") {
++#   attr(ohlcv$date, "tzone") <- "America/New_York"
++# }
++# tail(ohlcv, 15)
++ohlcv[symbol == "a"]
++head(ohlcv, 20)
++ohlcv = Ohlcv$new(ohlcv[, .(symbol, date, open, high, low, close, volume)],
++                  date_col = "date")
++
++# Exuber
++exuber_init = RollingExuber$new(
++  windows = c(100, 400, 800, 1000),
++  workers = 1L,
++  at = 1:nrow(ohlcv$X),
++  lag = 0L,
++  exuber_lag = c(0L, 1L)
++)
++exuber = exuber_init$get_rolling_features(ohlcv, log_prices = TRUE)
++fwrite(exuber, file.path(PATH_PREDICTORS, paste0(symbol_i, ".csv")))
+diff --git a/padobran_predictors.sh b/padobran_predictors.sh
+new file mode 100644
+index 0000000..7567681
+--- /dev/null
++++ b/padobran_predictors.sh
+@@ -0,0 +1,12 @@
++#!/bin/bash
++
++#PBS -N predictors
++#PBS -l ncpus=1
++#PBS -l mem=1GB
++#PBS -J 1-9870
++#PBS -o logs
++#PBS -j oe
++
++cd ${PBS_O_WORKDIR}
++
++apptainer run image.sif padobran_predictors.R
+diff --git a/padobran_to_local.R b/padobran_to_local.R
+new file mode 100644
+index 0000000..34c2b70
+--- /dev/null
++++ b/padobran_to_local.R
+@@ -0,0 +1,94 @@
++library(data.table)
++library(lubridate)
++
++
++# SETUP -------------------------------------------------------------------
++# Globals
++if (interactive()) {
++  PATH = "D:/strategies/exuber"
++}
++
++# Create indicators directory if it doesn't exist
++if (interactive()) {
++  if (!dir.exists(file.path(PATH, "indicators"))) {
++    dir.create(file.path(PATH, "indicators"))
++  }
++}
++
++
++# DATA --------------------------------------------------------------------
++# Check columns
++# colnames(fread(list.files(file.path(PATH, "predictors"), full.names = TRUE)[1]))
++
++# Current column
++# if (interactive()) {
++#   i = 1L
++# } else {
++#   i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
++# }
++# i = i + 2L
++# cols = c(1, 2, i)
++
++# Get files
++if (interactive()) {
++  files = list.files(file.path(PATH, "predictors"), full.names = TRUE)
++} else {
++  files = list.files("predictors", full.names = TRUE)
++}
++
++# Import predictors in chunks Predictors
++system.time({
++  dt = lapply(files, fread) # , select = cols
++})
++format(object.size(dt), units = "auto")
++dt = rbindlist(dt, fill= TRUE)
++dt[, date := with_tz(date, tzone = "America/New_York")]
++setorder(dt, symbol, date)
++
++# Median aggreagation
++radf_vars = colnames(dt)[grepl("exuber", colnames(dt))]
++indicators_median = dt[, lapply(.SD, median, na.rm = TRUE), by = c('date'), .SDcols = radf_vars]
++setnames(indicators_median, radf_vars, paste0("median_", radf_vars))
++
++# Standard deviation aggregation
++indicators_sd = dt[, lapply(.SD, sd, na.rm = TRUE), by = c('date'), .SDcols = radf_vars]
++setnames(indicators_sd, radf_vars, paste0("sd_", radf_vars))
++
++# Mean aggregation
++indicators_mean = dt[, lapply(.SD, mean, na.rm = TRUE), by = c('date'), .SDcols = radf_vars]
++setnames(indicators_mean, radf_vars, paste0("mean_", radf_vars))
++
++# Sum aggreagation
++indicators_sum = dt[, lapply(.SD, sum, na.rm = TRUE), by = c('date'), .SDcols = radf_vars]
++setnames(indicators_sum, radf_vars, paste0("sum_", radf_vars))
++
++# Expected Shartfall
++indicators_es = dt[, lapply(.SD, function(x) {
++  if (length(x) < 2) return(NA_real_)
++  PerformanceAnalytics::ES(diff(x), p = 0.05, method = "modified")
++}), by = date, .SDcols = radf_vars]
++
++# Merge indicators
++indicators = Reduce(
++  function(x, y)
++    merge(
++      x,
++      y,
++      by = "date",
++      all.x = TRUE,
++      all.y = TRUE
++    ),
++  list(
++    indicators_sd,
++    indicators_median,
++    indicators_sum,
++    indicators_mean
++  )
++)
++setorder(indicators, date)
++
++# Remove missing values
++indicators = na.omit(indicators)
++
++# Save indicators
++fwrite(indicators, "indicators.csv")
+diff --git a/prepare_data_padobran.R b/prepare_data_padobran.R
+new file mode 100644
+index 0000000..ddc9aee
+--- /dev/null
++++ b/prepare_data_padobran.R
+@@ -0,0 +1,58 @@
++library(data.table)
++library(finutils)
++
++
++# Setup
++PATH_PRICES = "D:/strategies/lowvol"
++if (!dir.exists(PATH_PRICES)) dir.create(PATH_PRICES, recursive = TRUE)
++
++# Prices data
++prices = qc_daily_parquet(
++  file_path = "F:/lean/data/all_stocks_daily",
++  etfs = FALSE,
++  min_obs = 252,
++  duplicates = "fast",
++  add_dv_rank = FALSE,
++  add_day_of_month = FALSE,
++  profiles_fmp = TRUE,
++  fmp_api_key = Sys.getenv("APIKEY")
++)
++
++# Remove ETF's
++prices = prices[isEtf == FALSE & isFund == FALSE]
++
++# Save every symbol separately
++prices_dir = file.path(PATH_PRICES, "prices")
++if (!dir.exists(prices_dir)) {
++  dir.create(prices_dir)
++}
++for (s in prices[, unique(symbol)]) {
++  if (s == "prn") next()
++  prices_ = prices[symbol == s]
++  if (nrow(prices_) < 22) next
++  file_name = file.path(prices_dir, paste0(s, ".csv"))
++  fwrite(prices_, file_name)
++}
++
++# Create sh file for predictors
++cont = sprintf(
++  "#!/bin/bash
++
++#PBS -N predictors
++#PBS -l ncpus=1
++#PBS -l mem=1GB
++#PBS -J 1-%d
++#PBS -o logs
++#PBS -j oe
++
++cd ${PBS_O_WORKDIR}
++
++apptainer run image.sif padobran_predictors.R",
++  length(list.files(prices_dir)))
++writeLines(cont, "padobran_predictors.sh")
++
++# Add to padobran
++# scp -r /home/sn/data/strategies/pead/prices padobran:/home/jmaric/peadml/prices
++
++# Delete prices folder to free space
++
